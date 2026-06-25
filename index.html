@@ -603,9 +603,29 @@ canvas.addEventListener('click', e => {
 canvas.addEventListener('touchstart', e => {
   e.preventDefault();
   const t = e.touches[0], rect = canvas.getBoundingClientRect();
-  const gx = (t.clientX - rect.left) * GW / rect.width, gy = (t.clientY - rect.top) * GH / rect.height;
-  if (S.mode==='explore') touchTarget={x:gx,y:gy};
-  else canvas.dispatchEvent(new MouseEvent('click',{clientX:t.clientX,clientY:t.clientY}));
+  const sx = GW / rect.width, sy = GH / rect.height;
+  const gx = (t.clientX - rect.left) * sx, gy = (t.clientY - rect.top) * sy;
+
+  if (S.mode === 'title') { S.mode = 'rules'; return; }
+  if (S.mode === 'rules') { startIntro(); return; }
+  if (S.mode === 'dialogue') { nextDialog(); return; }
+  if (S.mode === 'ending') { restartGame(); return; }
+  if (S.mode === 'choice') {
+    const baseY = GH - 64 - S.choices.length * 24;
+    for (let i=0;i<S.choices.length;i++) { if(gy>baseY+i*24&&gy<baseY+i*24+22){ const c=S.choices[i]; S.choices=[]; S.mode='dialogue'; c.cb(); return; } }
+    return;
+  }
+  if (S.mode === 'rhythm') {
+    const btns=[{d:'left',x:50,y:195,w:40,h:35},{d:'up',x:100,y:195,w:40,h:35},{d:'down',x:150,y:195,w:40,h:35},{d:'right',x:200,y:195,w:40,h:35}];
+    for(const b of btns){ if(gx>b.x&&gx<b.x+b.w&&gy>b.y&&gy<b.y+b.h){ hitRhythm(b.d); return; } }
+  }
+  if (S.mode === 'explore') {
+    // Check if tapping on an interactive object first
+    const objs = (OBJS[S.scene]||[]).filter(o=>!o.visible||o.visible());
+    for(const o of objs){ if(gx>o.x-8&&gx<o.x+o.w+8&&gy>o.y-8&&gy<o.y+o.h+8&&dist(S.pos,{x:o.x+o.w/2,y:o.y+o.h/2})<55){ o.interact(); return; } }
+    // Otherwise move to tap location
+    touchTarget = {x:gx,y:gy};
+  }
 });
 canvas.addEventListener('touchmove', e => e.preventDefault());
 
