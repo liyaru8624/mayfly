@@ -1,0 +1,935 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>蜉蝣的72小时 — 像素人生模拟器 #001</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  background: #1B2A31;
+  display: flex; justify-content: center; align-items: center;
+  height: 100vh; height: 100dvh; width: 100vw;
+  overflow: hidden;
+  font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
+  touch-action: none;
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+#game {
+  image-rendering: pixelated; image-rendering: crisp-edges;
+  cursor: crosshair; display: block;
+  margin: 0 auto;
+}
+#hint {
+  position: fixed; bottom: 8px; left: 50%; transform: translateX(-50%);
+  color: #e0d7c788; font-size: 11px; pointer-events: none;
+  text-align: center; letter-spacing: 1px;
+}
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<div id="hint">←→↑↓ 移动 &nbsp; 空格 互动 &nbsp; | &nbsp; 手机点击移动</div>
+<script>
+// ═══════════════════════════════════════════
+//  CONSTANTS
+// ═══════════════════════════════════════════
+const GW = 320, GH = 240;
+const CD = 2; // internal device pixel scale
+const C = {
+  // 基于莫兰迪暗色参考 (#1B2A31) + 咸柠/橘子汽水柔调
+  bg:   '#1B2A31',  // 暗枪灰绿底
+  dark: '#1e3038',  // 面板暗色
+  green:'#5399A0',  // 月石青 — 生命力/植物
+  amber:'#e89870',  // 暖橘 — 能量/飞行，高对比度
+  white:'#E0D7C7',  // 暖骨白 — 主文字
+  red:  '#c08080',  // 柔红 — 危险提示
+  blue: '#5a9098',  // 湖水蓝
+  brown:'#8a7060',  // 树干/泥土
+  water:'#356070',  // 深河水
+  sky:  '#243540',  // 夜空底
+  moss: '#6a9870',  // 苔绿 — 灌木
+  leaf: '#80b090',  // 叶绿 — 水草
+  sun:  '#d4a878',  // 暖阳色 — 夕阳/太阳
+  darktext: '#1B2A31',
+};
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+ctx.imageSmoothingEnabled = false;
+
+// Load saved endings
+let savedEndings = [];
+try { savedEndings = JSON.parse(localStorage.getItem('mayfly_endings') || '[]'); } catch(e) {}
+
+// ═══════════════════════════════════════════
+//  GAME STATE
+// ═══════════════════════════════════════════
+const S = {
+  scene: 'river_bottom', day: 1, time: 'morning',
+  satiety: 70, flight: 40, stage: 'nymph',
+  pos: { x: 160, y: 180 }, target: null,
+  flags: {}, mode: 'title', ending: null,
+  frame: 0, transition: 0,
+  particles: [], shake: 0,
+  // dialogue
+  dq: [], dtext: '', dchar: 0, dtimer: 0, choices: [],
+  // qte
+  qteProgress: 0, qteDeplete: 3, qteGain: 8, qteLastDir: -1,
+  // rhythm
+  rNotes: [], rHitZone: 180, rScore: 0, rTotal: 6, rActive: false,
+  // timers
+  wingDryTimer: 0, sceneTimer: 0,
+  // flags
+  foodChosen: false, scene3Interactions: 0,
+  _noonTriggered: false, _wingChoiceOffered: false, _choiceIdx: 0,
+  _onDialogEnd: null, _endingData: null,
+  // save tracking
+  _wingDryCheck: null,
+};
+
+// ═══════════════════════════════════════════
+//  PIXEL SPRITES (1=on, 0=off)
+// ═══════════════════════════════════════════
+const NYMPH = [
+  [0,0,1,1,0,0],[0,1,1,1,1,0],[0,0,1,1,0,0],[0,1,0,0,1,0],
+  [1,1,0,1,1,0],[1,0,0,0,0,1],[0,1,1,1,1,0],[0,0,1,1,0,0],
+];
+const ADULT = [
+  [0,0,0,1,1,0,0,0],[0,0,1,1,1,1,0,0],[0,0,1,1,1,1,0,0],[0,0,0,1,1,0,0,0],
+  [0,1,0,1,1,0,1,0],[1,0,0,1,1,0,0,1],[0,1,1,0,0,1,1,0],[0,0,1,1,1,1,0,0],
+  [0,0,0,1,1,0,0,0],[0,0,1,0,0,1,0,0],[0,1,0,0,0,0,1,0],[1,0,0,0,0,0,0,1],
+];
+const FROG_SPR = [
+  [0,1,1,0,0,1,1,0],[1,0,0,1,1,0,0,1],[0,1,1,1,1,1,1,0],
+  [0,0,1,1,1,1,0,0],[0,0,1,0,0,1,0,0],[0,0,1,1,1,1,0,0],
+];
+
+function drawSprite(spr, x, y, color, scale = 1) {
+  for (let r = 0; r < spr.length; r++)
+    for (let c = 0; c < spr[r].length; c++)
+      if (spr[r][c]) { ctx.fillStyle = color; ctx.fillRect(x + c * scale, y + r * scale, scale, scale); }
+}
+
+// ═══════════════════════════════════════════
+//  HELPERS
+// ═══════════════════════════════════════════
+function px(x, y, w, h, c) { ctx.fillStyle = c; ctx.fillRect(x|0, y|0, w, h); }
+function rr(x, y, w, h, c) { ctx.fillStyle = c; ctx.fillRect(x, y, w, h); }
+function txt(str, x, y, size, color) { ctx.fillStyle = color||C.white; ctx.font = `${size}px "Microsoft YaHei","PingFang SC",monospace`; ctx.fillText(str, x, y); }
+function txtM(str, x, y, size, color) { ctx.fillStyle = color||C.white; ctx.font = `${size}px "Courier New",monospace`; ctx.fillText(str, x, y); }
+function dist(a, b) { return Math.sqrt((a.x-b.x)**2 + (a.y-b.y)**2); }
+function rand(a,b) { return a + Math.random()*(b-a); }
+
+// Gradient banding (pixel-style "gradient" using horizontal strips)
+function bandedSky(topColors) {
+  const steps = topColors.length;
+  for (let i = 0; i < steps; i++) {
+    const y0 = (GH * i / steps) | 0;
+    const y1 = (GH * (i + 1) / steps) | 0;
+    rr(0, y0, GW, y1 - y0, topColors[i]);
+  }
+}
+
+function drawWavyLine(y, amp, freq, color, w = GW) {
+  ctx.fillStyle = color;
+  for (let x = 0; x < w; x++) {
+    const dy = Math.sin(x * freq + S.frame * 0.02) * amp;
+    ctx.fillRect(x, y + dy, 1, 1);
+  }
+}
+
+// ═══════════════════════════════════════════
+//  SCENE RENDERERS
+// ═══════════════════════════════════════════
+function drawScene1() {
+  bandedSky(['#1B2A31','#1e3038','#1c2e36','#1a2c34','#182830','#162428']);
+  for (let i = 0; i < 8; i++)
+    drawWavyLine(25 + i * 35, 2 + i * 0.5, 0.03 + i * 0.01, C.white + '14');
+  for (let i = 0; i < 20; i++) {
+    const ppx = (i * 97 + S.frame * (0.3 + i * 0.03)) % GW;
+    const ppy = 30 + (i * 53) % 160;
+    px(ppx, ppy, 2, 2, C.green + '33');
+  }
+  rr(16, 155, 64, 32, '#1a2830'); rr(14, 150, 68, 8, '#243038');
+  rr(236, 165, 72, 38, '#1a2830'); rr(234, 160, 76, 8, '#243038');
+  rr(110, 195, 100, 45, '#182428');
+  for (let i = 0; i < 9; i++) {
+    const bx = 25 + i * 36;
+    const bh = 28 + Math.sin(S.frame * 0.03 + i) * 8;
+    for (let j = 0; j < 6; j++) {
+      const lx = bx + j * 2;
+      const ly = 200 - bh - j * 4 + Math.sin(S.frame * 0.05 + i + j) * 3;
+      px(lx, ly, 3, bh + j * 4, C.leaf + 'aa');
+    }
+  }
+  rr(0, 208, GW, 32, '#1e2a28');
+  for (let i = 0; i < GW; i += 4)
+    px(i, 210 + Math.sin(i * 0.4) * 3, 4, 2, C.moss + '33');
+}
+
+function drawScene2() {
+  if (S.time === 'dusk' || S.time === 'night') {
+    bandedSky(['#1B2A31','#1a2830','#1c2a32','#192630','#1B2A31']);
+  } else {
+    bandedSky(['#1B2A31','#203540','#1e3240','#1a2e3a','#1B2A31']);
+  }
+  if (S.time === 'night' || S.time === 'dusk') {
+    for (let i = 0; i < 40; i++) {
+      const sx = (i * 73 + 17) % GW, sy = (i * 47 + 11) % 105;
+      const b = 0.4 + Math.sin(S.frame * 0.02 + i) * 0.4;
+      px(sx, sy, 1, 1, C.white + Math.floor(b * 14).toString(16));
+    }
+  }
+  if (S.time === 'night') {
+    rr(255, 25, 22, 22, C.amber + '33');
+    rr(261, 29, 12, 12, C.amber + '88');
+  }
+  drawWavyLine(120, 7, 0.025, C.white + '44');
+  drawWavyLine(121, 7, 0.028, C.blue + '66');
+  for (let y = 130; y < GH; y += 5)
+    rr(0, y, GW, 5, C.water + Math.floor(10 + (y - 130) / 5).toString(16));
+  for (let i = 0; i < 5; i++) {
+    const rx = 48 + i * 62;
+    for (let j = 0; j < 38; j++)
+      px(rx + Math.sin(j * 0.2) * 2, 98 + j * 3, 2, 3, C.leaf + 'aa');
+    px(rx - 3, 95, 8, 5, C.brown);
+  }
+}
+
+function drawScene3() {
+  bandedSky(['#1f3630','#1c3230','#1a2e2c','#172a26','#142420']);
+  rr(0, 170, GW, 70, '#1e3028');
+  for (let i = 0; i < GW; i += 4)
+    px(i, 168 + Math.sin(i * 0.3) * 3, 4, 4, C.moss + '44');
+  for (let i = 0; i < 10; i++) {
+    const bx = i * 36 - 8;
+    for (let r = 0; r < 10; r++)
+      for (let c = 0; c < 12; c++)
+        if ((r - 5) * (r - 5) + (c - 6) * (c - 6) < 36 + i % 3 * 4)
+          px(bx + c * 3, 145 + r * 3, 3, 3, i % 2 ? C.leaf + '88' : C.moss + 'aa');
+  }
+  px(90, 152, 4, 4, C.amber); px(96, 149, 4, 4, C.amber);
+  px(93, 155, 4, 4, C.amber); px(92, 159, 2, 5, C.green);
+  px(202, 147, 4, 4, C.white); px(208, 144, 4, 4, C.white);
+  px(205, 150, 4, 4, C.white); px(204, 154, 2, 5, C.green);
+  for (let a = 0; a < 8; a++) {
+    const angle = a * Math.PI / 4;
+    for (let r = 0; r < 14; r++)
+      px(270 + Math.cos(angle) * r, 108 + Math.sin(angle) * r, 1, 1, C.white + '44');
+  }
+}
+
+function drawScene4() {
+  // Warm orange sunset — 橘调夕阳
+  bandedSky(['#1a1030','#281838','#3a2040','#502838','#683828','#804820','#885020','#785020','#584020','#383018']);
+  // Sun glow layers
+  rr(230, 32, 36, 36, '#e89870' + '33');
+  rr(236, 38, 24, 24, '#e89870' + '66');
+  rr(242, 44, 12, 12, '#e89870' + 'cc');
+  rr(246, 48, 4, 4, '#ffe8d0');
+  // Clouds — warm peach/orange tinted
+  for (let i = 0; i < 5; i++) {
+    const cx = ((i * 85 + S.frame * 0.06) % (GW + 70)) - 35;
+    const cy = 18 + i * 18;
+    for (let j = 0; j < 18; j++) {
+      const alpha = Math.floor(8 + Math.abs(j - 9) * 1.5).toString(16);
+      px(cx + j * 3, cy + Math.sin(j * 0.5) * 2, 4, 4, '#ffc4af' + alpha);
+    }
+  }
+  // Winding river — warmer reflection tones
+  for (let x = 0; x < GW; x += 2) {
+    const ry = 166 + Math.sin(x * 0.02) * 22 + Math.sin(x * 0.05) * 8;
+    for (let y = ry; y < GH; y += 2) {
+      const depth = (y - ry) / (GH - ry);
+      const r = Math.floor(40 + depth * 30);
+      const g = Math.floor(28 + depth * 22);
+      const b = Math.floor(50 + depth * 35);
+      const a = (0.04 + depth * 0.04).toFixed(3);
+      ctx.fillStyle = `rgba(${r},${g},${b},${a})`;
+      ctx.fillRect(x, y, 2, 2);
+    }
+  }
+  // Mayfly swarm — golden dancing dots
+  for (let i = 0; i < 35; i++) {
+    const mx = (i * 67 + S.frame * (0.8 + i * 0.25)) % GW;
+    const my = 45 + Math.sin(S.frame * 0.02 + i) * 48;
+    const sz = (i % 3 === 0) ? 3 : 2;
+    px(mx, my, sz, sz, '#e89870' + 'cc');
+  }
+  // A few closer/bigger mayflies
+  for (let i = 0; i < 8; i++) {
+    const mx = (i * 103 + 30) % GW;
+    const my = 55 + Math.sin(S.frame * 0.015 + i * 0.7) * 35;
+    drawSprite(ADULT, mx - 4, my - 6, '#e89870', 1);
+  }
+}
+
+function drawScene5() {
+  bandedSky(['#1e3438','#203838','#1e3236','#1a2c30','#182a2c']);
+  for (let i = 0; i < 12; i++) {
+    const tx = i * 28;
+    rr(tx + 8, 35, 5, 85, C.brown + 'aa');
+    for (let r = 0; r < 14; r++)
+      for (let c = 0; c < 18; c++)
+        if ((r - 7) * (r - 7) + (c - 9) * (c - 9) < 65)
+          px(tx - 2 + c * 2, 16 + r * 2, 2, 2, C.leaf + '66');
+  }
+  for (let y = 128; y < 190; y++) {
+    const a = Math.floor(14 + Math.sin(y * 0.1) * 3).toString(16);
+    rr(0, y, GW, 1, C.water + a);
+  }
+  for (let i = 0; i < 12; i++)
+    drawWavyLine(135 + i * 5, 2, 0.05 + i * 0.01, C.white + '16');
+  rr(228, 178, 44, 22, '#1a2830'); rr(226, 175, 48, 5, '#243038');
+  rr(26, 183, 28, 17, '#1a2830');
+}
+
+const SCENES = { river_bottom: drawScene1, water_surface: drawScene2, riverside: drawScene3, river_sky: drawScene4, upstream: drawScene5 };
+
+// ═══════════════════════════════════════════
+//  SCENE OBJECTS
+// ═══════════════════════════════════════════
+const OBJS = {
+  river_bottom: [
+    { id:'plants', x:75, y:168, w:34, h:32, label:'水草', color:C.green,
+      draw(o){ for(let j=0;j<8;j++)px(o.x+j*3,o.y-Math.sin(S.frame*0.05+j)*5,4,12+Math.sin(S.frame*0.05+j)*6,C.green+'88'); },
+      interact(){ queueDialog(['你啃了几口水草。味道不怎么样，但能填饱肚子。']); S.satiety=Math.min(100,S.satiety+5); S.flags.ate_plants=true; checkRiver(); }
+    },
+    { id:'crevice', x:215, y:162, w:44, h:28, label:'石头缝', color:C.amber,
+      draw(o){ rr(o.x,o.y,o.w,o.h,'#1a2832'); rr(o.x-2,o.y-3,o.w+4,7,'#243440'); },
+      interact(){ queueDialog(['你缩回石头缝里。这里很安全，但你已经躲了整整一年了。']); S.satiety=Math.max(10,S.satiety-5); S.flags.hid=true; checkRiver(); }
+    },
+    { id:'leaf', x:155, y:95, w:18, h:10, label:'落叶', color:C.amber,
+      visible:()=>S.time==='noon'&&!S.foodChosen,
+      draw(o){ px(o.x+(S.frame%10),o.y+Math.sin(S.frame*0.1)*2,o.w,o.h,C.amber+'99'); },
+      interact(){ showChoices('一片落叶上粘着藻类和微生物，看起来更美味。',[
+        {text:'追逐落叶上的美食', cb:()=>{ S.satiety=Math.min(100,S.satiety+20); S.flight=Math.min(100,S.flight+15); S.foodChosen=true; queueDialog(['你拼命游向落叶，吃到了丰盛的一餐！','这顿饱饭让你浑身充满了力量。']); checkRiver(); }},
+        {text:'吃附近的水草', cb:()=>{ S.satiety=Math.min(100,S.satiety-5); S.flight=Math.max(0,S.flight-5); S.foodChosen=true; queueDialog(['你选择了安全，但水草没什么营养。','饱食和飞行力下降了……']); checkRiver(); }}
+      ],()=>{});}
+    },
+  ],
+  water_surface: [
+    { id:'reed', x:42, y:95, w:12, h:55, label:'芦苇茎', color:C.green, visible:()=>S.stage==='nymph',
+      draw(o){ for(let j=0;j<22;j++)px(o.x+Math.sin(j*0.2)*2,o.y+j*3,3,4,C.green+'99'); },
+      interact(){ queueDialog(['你抓住芦苇茎向上爬。水面越来越近了。']); S.flags.climbed_reed=true; }
+    },
+    { id:'reflection', x:258, y:120, w:24, h:24, label:'水面倒影', color:C.blue, visible:()=>S.stage==='adult',
+      draw(o){ rr(o.x,o.y,o.w,o.h,C.blue+'22'); px(o.x+5,o.y+5,14,14,C.white+'18'); },
+      interact(){ queueDialog(['水中倒映着你的新身体——透明的翅膀，纤细的尾巴。','你从未见过自己这个样子。']); S.flags.looked_reflection=true; }
+    },
+  ],
+  riverside: [
+    { id:'flowers', x:88, y:142, w:22, h:22, label:'野花', color:C.amber,
+      draw(o){ px(o.x,o.y,4,4,C.amber);px(o.x+8,o.y-3,4,4,C.amber);px(o.x+4,o.y+5,2,6,C.green); },
+      interact(){ queueDialog(['你吸了一口花蜜。甘甜的能量涌入身体。']); S.satiety=Math.min(100,S.satiety+15); S.flight=Math.min(100,S.flight+10); S.scene3Interactions++; checkScene3(); }
+    },
+    { id:'web', x:258, y:96, w:26, h:26, label:'蜘蛛网', color:C.white,
+      draw(o){ for(let a=0;a<8;a++){const ang=a*Math.PI/4;for(let r=0;r<13;r++)px(o.x+13+Math.cos(ang)*r,o.y+13+Math.sin(ang)*r,1,1,C.white+'44');} px(o.x+7,o.y+7,3,3,C.dark); },
+      interact(){ showChoices('蜘蛛网上挂着一串露珠，晶莹剔透。但蜘蛛就在旁边。',[
+        {text:'冒险取露珠', cb:()=>{ if(Math.random()<0.6){ queueDialog(['你取下了露珠项链！露水折射出彩虹般的光芒。']); S.flight=Math.min(100,S.flight+25); S.flags.dew_necklace=true; } else { queueDialog(['蜘蛛扑了过来！你受了点伤。']); S.satiety=Math.max(10,S.satiety-20); } S.scene3Interactions++; checkScene3(); }},
+        {text:'还是算了', cb:()=>{ queueDialog(['你明智地绕开了蜘蛛网。']); }}
+      ],()=>{});}
+    },
+    { id:'frog', x:168, y:168, w:18, h:18, label:'青蛙', color:C.green,
+      draw(o){ drawSprite(FROG_SPR,o.x,o.y,C.green,2); },
+      interact(){ queueDialog(['老青蛙：「呱！一只蜉蝣！」','「我在河边住了五年，见过无数你的同类。」','「最好的产卵地在上游，过了那个弯就是。」','「不过你得快——你们的生命太短了。」']); S.flags.talked_frog=true; S.scene3Interactions++; checkScene3(); }
+    },
+    { id:'dewdrop', x:138, y:95, w:10, h:10, label:'露珠', color:C.white,
+      draw(o){ px(o.x,o.y,5,5,C.white+'88');px(o.x+1,o.y-1,2,2,C.white); },
+      interact(){ queueDialog(['你喝了一滴露水。清凉解渴。']); S.satiety=Math.min(100,S.satiety+8); S.scene3Interactions++; checkScene3(); }
+    },
+  ],
+  river_sky: [
+    { id:'swarm', x:145, y:55, w:70, h:60, label:'蜉蝣群', color:C.amber,
+      draw(o){ for(let i=0;i<18;i++){const mx=o.x+(i*11)%55;const my=o.y+Math.sin(S.frame*0.05+i)*18;px(mx,my,3,3,C.amber+'88');} },
+      interact(){ queueDialog(['成千上万只蜉蝣在夕阳下飞舞。','这是你一生只有一次的机会。']); startRhythm(); }
+    },
+  ],
+  upstream: [
+    { id:'water', x:135, y:125, w:50, h:35, label:'水面', color:C.blue,
+      draw(o){ for(let i=0;i<7;i++)drawWavyLine(o.y+i*6,2,0.04+i*0.01,C.white+'22'); },
+      interact(){ showChoices('你感觉到了生命的流逝。水面在呼唤你。',[
+        {text:'全力产卵 (+大量后代)', cb:()=>{ triggerEnding('A'); }},
+        {text:'适量产卵，留力气看夕阳', cb:()=>{ triggerEnding('C'); }},
+      ],()=>{});}
+    },
+    { id:'stone', x:236, y:178, w:34, h:18, label:'石头', color:C.amber,
+      draw(o){ rr(o.x,o.y,o.w,o.h,'#1a2832');rr(o.x-2,o.y-3,o.w+4,5,'#243440'); },
+      interact(){ queueDialog(['太累了……你在石头上停下来休息。','眼皮越来越重。']); triggerEnding('D'); }
+    },
+  ],
+};
+
+// ═══════════════════════════════════════════
+//  DIALOGUE SYSTEM
+// ═══════════════════════════════════════════
+function queueDialog(lines) {
+  S.dq = S.dq.concat(lines);
+  if (S.mode !== 'dialogue' && S.mode !== 'choice') { S.mode = 'dialogue'; nextDialog(); }
+}
+function nextDialog() {
+  if (S.dq.length === 0) {
+    S.mode = 'explore'; S.dtext = ''; S.dchar = 0;
+    if (S._onDialogEnd) { const cb = S._onDialogEnd; S._onDialogEnd = null; cb(); }
+    return;
+  }
+  const line = S.dq.shift();
+  if (typeof line === 'object' && line.choices) {
+    S.choices = line.choices; S.mode = 'choice';
+    S.dtext = line.text || ''; S.dchar = S.dtext.length;
+    S._choiceCb = line.cb; S._choiceIdx = 0; return;
+  }
+  S.dtext = line; S.dchar = 0; S.dtimer = 0; S.mode = 'dialogue';
+}
+function showChoices(text, choices, cb) {
+  S.dtext = text; S.dchar = text.length; S.choices = choices;
+  S.mode = 'choice'; S._choiceCb = cb; S._choiceIdx = 0;
+}
+
+// ═══════════════════════════════════════════
+//  EVENT LOGIC
+// ═══════════════════════════════════════════
+function checkRiver() {
+  if (S.foodChosen && S.time === 'noon') {
+    S.time = 'dusk';
+    queueDialog(['天色渐暗。一股无法抗拒的冲动涌上来。','你必须浮出水面。现在。']);
+    S._onDialogEnd = () => changeScene('water_surface');
+  }
+  if ((S.flags.ate_plants || S.flags.hid) && !S._noonTriggered && S.time === 'morning') {
+    S.time = 'noon'; S._noonTriggered = true;
+    queueDialog(['正午的阳光透过水面照下来。','一片落叶从上方漂过，上面粘满了可口的微生物。']);
+  }
+}
+function checkScene3() {
+  if (S.scene3Interactions >= 2 && S.time === 'daytime') {
+    S.time = 'dusk';
+    queueDialog(['太阳开始西斜。空气中弥漫着奇异的躁动。','远处，一群蜉蝣开始聚集在河流上空。','你的翅膀颤动起来——你知道这意味着什么。']);
+    S._onDialogEnd = () => changeScene('river_sky');
+  }
+}
+
+function changeScene(scene) {
+  S.transition = 0.02; // start fade out
+  S._sceneTarget = scene;
+}
+function finishSceneChange() {
+  S.scene = S._sceneTarget; S._sceneTarget = null;
+  S.transition = -1; S.mode = 'explore'; S.particles = [];
+  onEnterScene(S.scene);
+}
+
+function onEnterScene(scene) {
+  S.sceneTimer = 0;
+  switch(scene) {
+    case 'river_bottom': S.pos = {x:160,y:180}; break;
+    case 'water_surface':
+      S.pos = {x:160,y:150};
+      if (S.stage === 'nymph' && S.time === 'dusk') {
+        queueDialog(['你冲出了水面！','你的旧壳紧紧裹着你。必须挣脱它。','没有回头路了。']);
+        S._onDialogEnd = () => startQTE();
+      }
+      break;
+    case 'riverside':
+      S.pos = {x:60,y:160}; S.time = 'daytime'; S.scene3Interactions = 0;
+      queueDialog(['岸边是一片灌木丛。野花盛开，露珠闪烁。','你需要补充能量，为今晚的飞行做准备。']);
+      break;
+    case 'river_sky':
+      S.pos = {x:160,y:140};
+      queueDialog(['河面上空，夕阳把天空染成了金色。','成千上万只蜉蝣在这里聚集。','这是婚飞——一生只有一次的舞蹈。']);
+      break;
+    case 'upstream':
+      S.pos = {x:160,y:170}; S.day = 3; S.time = 'morning';
+      const extra = S.flags.talked_frog ? '老青蛙说的没错，这里真是个好地方。' : '你凭本能找到了这个地方。';
+      queueDialog(['上游的浅滩。水流平缓，河床柔软。', extra, '你的配偶已经完成了使命，回归水中。','现在轮到你了。但你的身体正在迅速衰竭。']);
+      break;
+  }
+}
+
+// ═══════════════════════════════════════════
+//  ENDINGS
+// ═══════════════════════════════════════════
+function triggerEnding(code) {
+  S.ending = code; S.mode = 'ending';
+  if (!savedEndings.includes(code)) { savedEndings.push(code); saveEndings(); }
+  const ED = {
+    A: { title:'满月之卵', sub:'完美结局', color:C.amber, lines:[
+      '你把全部精力化作数百颗卵，轻轻放入水中。','它们缓缓沉入河底，等待下一个春天。','你看不到它们孵化。但你知道。','明年这条河上，又会升起一片蜉蝣云。',
+      '——有些生命虽短，却足以点亮一整条河流。'
+    ]},
+    B: { title:'孤独的黄昏', sub:'结局', color:C.white, lines:[
+      '你没有加入那场舞蹈。','也许是因为疲惫，也许是因为别的什么。','你独自飞过河面，看着夕阳一点点沉没。','不是每条生命都需要留下什么。',
+      '——存在过，就已经很美了。'
+    ]},
+    C: { title:'最后的夕阳', sub:'结局', color:C.amber, lines:[
+      '你产下适量的卵，然后找了一块温暖的石头。','太阳正沉入树梢。','整个山谷被橙色的光灌满。','这一生虽然短暂，但每个瞬间都是完整的。',
+      '——七十个小时，够看一次完美的日落。'
+    ]},
+    D: { title:'水面的涟漪', sub:'结局', color:C.white, lines:[
+      '你的力气耗尽了。','你轻轻落在水面上，涟漪一圈圈散开。','很小很小的涟漪。但水面记住了。',
+      '——每只蜉蝣都在这条河里留下了自己的波纹。'
+    ]},
+    E: { title:'石头下的秘密', sub:'隐藏结局', color:C.green, lines:[
+      '旧壳太紧了。你的身体太虚弱了。','你缓缓沉回河底，回到你出发的那块石头下。','黑暗重新包裹了你。但这不是终点。',
+      '——明年春天，又有一只小蜉蝣会从这块石头下醒来。'
+    ]},
+  };
+  S._endingData = ED[code];
+}
+function saveEndings() {
+  try { localStorage.setItem('mayfly_endings', JSON.stringify(savedEndings)); } catch(e) {}
+}
+
+// ═══════════════════════════════════════════
+//  MINI-GAMES
+// ═══════════════════════════════════════════
+function startQTE() {
+  S.mode = 'qte'; S.qteProgress = 20;
+  if (S.satiety >= 50) { S.qteDeplete = 2.5; S.qteGain = 9; }
+  else if (S.satiety >= 30) { S.qteDeplete = 5; S.qteGain = 7; }
+  else { S.qteDeplete = 8; S.qteGain = 5; }
+  S.qteLastDir = -1;
+}
+function updateQTE() {
+  S.qteProgress -= S.qteDeplete / 60;
+  if (S.qteProgress <= 0) { S.mode='dialogue'; S.dq=[]; triggerEnding('E'); return; }
+  if (S.qteProgress >= 100) {
+    S.mode='dialogue'; S.dq=[]; S.stage='adult'; S.flight=Math.min(100,S.flight+30);
+    for (let i=0;i<40;i++) S.particles.push({x:S.pos.x,y:S.pos.y,color:C.amber,vx:rand(-3,3),vy:rand(-3,3),life:rand(20,50)});
+    queueDialog(['壳裂开了！你挣脱了出来！','你的身体柔软而崭新。两对透明的翅膀从背上展开。','你变成了一只成虫。你有了翅膀。','但翅膀需要时间干燥……']);
+    S.time='night'; S.wingDryTimer=600;
+    S._onDialogEnd = () => startWingDry();
+    return;
+  }
+}
+function startWingDry() {
+  S.mode='explore';
+  if (S._wingDryCheck) clearInterval(S._wingDryCheck);
+  S._wingDryCheck = setInterval(() => {
+    S.wingDryTimer--;
+    if (S.wingDryTimer <= 300 && !S._wingChoiceOffered) {
+      S._wingChoiceOffered = true;
+      showChoices('翅膀还没完全干透。但你已经等不及了。',[
+        {text:'耐心等待', cb:()=> queueDialog(['你继续等待。阳光温暖而舒适。'])},
+        {text:'现在就起飞', cb:()=>{ if(Math.random()<0.4){ queueDialog(['翅膀太湿了！你跌回水中。']); triggerEnding('D'); } else { queueDialog(['你奋力振翅——飞起来了！']); S.flight=Math.min(100,S.flight-10); S.wingDryTimer=0; finishWingDry(); } }},
+      ],()=>{});
+    }
+    if (S.wingDryTimer <= 0) { clearInterval(S._wingDryCheck); S._wingDryCheck=null; finishWingDry(); }
+  }, 16);
+}
+function finishWingDry() {
+  if (S._wingDryCheck) { clearInterval(S._wingDryCheck); S._wingDryCheck=null; }
+  S.day=2; S.time='daytime';
+  queueDialog(['翅膀完全干了。阳光穿过它们，折射出七彩的光芒。','你振翅飞向河边的灌木丛。一个全新的世界在等你。']);
+  S._onDialogEnd = () => changeScene('riverside');
+}
+
+function startRhythm() {
+  S.mode='rhythm'; S.rNotes=[]; S.rScore=0; S.rTotal=6;
+  const dirs=['left','up','down','right'];
+  for(let i=0;i<6;i++) S.rNotes.push({dir:dirs[Math.floor(Math.random()*4)], y:-30-i*35, hit:false});
+  S.rActive=true;
+}
+function updateRhythm() {
+  if (!S.rActive) return;
+  for (const n of S.rNotes) { if(!n.hit){ n.y+=1.2; if(n.y>S.rHitZone+20&&!n.hit){ n.hit=true; n.missed=true; } } }
+  if (S.rNotes.every(n=>n.hit)) {
+    S.rActive=false; const pct=S.rScore/S.rTotal;
+    if(pct>=0.5){ queueDialog(['你的舞姿吸引了注意！','一只蜉蝣向你飞来，你们在夕阳下翩翩起舞。']); S.flags.mated=true; S._onDialogEnd=()=>changeScene('upstream'); }
+    else { queueDialog(['你的舞蹈没有吸引到伴侣。','但夕阳还是很美。你独自在天空盘旋。']); S._onDialogEnd=()=>triggerEnding('B'); }
+  }
+}
+function hitRhythm(dir) {
+  let best=null;
+  for(const n of S.rNotes){ if(!n.hit&&n.y>S.rHitZone-18&&n.y<S.rHitZone+18&&n.dir===dir&&(!best||n.y>best.y)) best=n; }
+  if(best){ best.hit=true; S.rScore++; for(let i=0;i<8;i++) S.particles.push({x:160,y:S.rHitZone,color:C.amber,vx:rand(-2,2),vy:rand(-2,2),life:rand(15,30)}); }
+}
+
+// ═══════════════════════════════════════════
+//  INPUT
+// ═══════════════════════════════════════════
+const keys = {};
+let touchTarget = null;
+
+window.addEventListener('keydown', e => {
+  keys[e.key] = true;
+  if (S.mode === 'title') { S.mode = 'rules'; return; }
+  if (S.mode === 'rules') { startIntro(); return; }
+  if (S.mode === 'dialogue') { nextDialog(); return; }
+  if (S.mode === 'choice') {
+    if (e.key === 'ArrowUp') S._choiceIdx = Math.max(0, (S._choiceIdx||0) - 1);
+    if (e.key === 'ArrowDown') S._choiceIdx = Math.min(S.choices.length-1, (S._choiceIdx||0) + 1);
+    if (e.key === ' ') { const c=S.choices[S._choiceIdx||0]; if(c){ S.choices=[]; S.mode='dialogue'; c.cb(); S._choiceIdx=0; } }
+    return;
+  }
+  if (S.mode === 'qte') {
+    if (e.key === 'ArrowLeft' && S.qteLastDir !== 0) { S.qteProgress += S.qteGain; S.qteLastDir = 0; }
+    if (e.key === 'ArrowRight' && S.qteLastDir !== 1) { S.qteProgress += S.qteGain; S.qteLastDir = 1; }
+    return;
+  }
+  if (S.mode === 'rhythm') {
+    const map = { ArrowLeft:'left', ArrowUp:'up', ArrowDown:'down', ArrowRight:'right' };
+    if (map[e.key]) hitRhythm(map[e.key]); return;
+  }
+  if (S.mode === 'ending') { if (e.key === ' ' || e.key === 'Enter') restartGame(); return; }
+  if (S.mode === 'explore' && e.key === ' ') { interactNearest(); return; }
+});
+window.addEventListener('keyup', e => { keys[e.key] = false; });
+
+canvas.addEventListener('click', e => {
+  const rect = canvas.getBoundingClientRect();
+  const sx = GW / rect.width, sy = GH / rect.height;
+  const gx = (e.clientX - rect.left) * sx, gy = (e.clientY - rect.top) * sy;
+  if (S.mode === 'title') { S.mode = 'rules'; return; }
+  if (S.mode === 'rules') { startIntro(); return; }
+  if (S.mode === 'dialogue') { nextDialog(); return; }
+  if (S.mode === 'ending') { restartGame(); return; }
+  if (S.mode === 'choice') {
+    const baseY = GH - 64 - S.choices.length * 24;
+    for (let i=0;i<S.choices.length;i++) { if(gy>baseY+i*24&&gy<baseY+i*24+22){ const c=S.choices[i]; S.choices=[]; S.mode='dialogue'; c.cb(); return; } }
+    return;
+  }
+  if (S.mode === 'rhythm') {
+    const btns=[{d:'left',x:50,y:195,w:40,h:35},{d:'up',x:100,y:195,w:40,h:35},{d:'down',x:150,y:195,w:40,h:35},{d:'right',x:200,y:195,w:40,h:35}];
+    for(const b of btns){ if(gx>b.x&&gx<b.x+b.w&&gy>b.y&&gy<b.y+b.h){ hitRhythm(b.d); return; } }
+  }
+  if (S.mode === 'explore') {
+    const objs = (OBJS[S.scene]||[]).filter(o=>!o.visible||o.visible());
+    for(const o of objs){ if(gx>o.x-8&&gx<o.x+o.w+8&&gy>o.y-8&&gy<o.y+o.h+8&&dist(S.pos,{x:o.x+o.w/2,y:o.y+o.h/2})<55){ o.interact(); return; } }
+    touchTarget = {x:gx,y:gy};
+  }
+});
+canvas.addEventListener('touchstart', e => {
+  e.preventDefault();
+  const t = e.touches[0], rect = canvas.getBoundingClientRect();
+  const gx = (t.clientX - rect.left) * GW / rect.width, gy = (t.clientY - rect.top) * GH / rect.height;
+  if (S.mode==='explore') touchTarget={x:gx,y:gy};
+  else canvas.dispatchEvent(new MouseEvent('click',{clientX:t.clientX,clientY:t.clientY}));
+});
+canvas.addEventListener('touchmove', e => e.preventDefault());
+
+function interactNearest() {
+  const objs=(OBJS[S.scene]||[]).filter(o=>!o.visible||o.visible());
+  let best=null,bd=30;
+  for(const o of objs){ const d=dist(S.pos,{x:o.x+o.w/2,y:o.y+o.h/2}); if(d<bd){bd=d;best=o;} }
+  if(best) best.interact();
+}
+
+// ═══════════════════════════════════════════
+//  UPDATE
+// ═══════════════════════════════════════════
+function update() {
+  S.frame++;
+  S.sceneTimer++;
+
+  // Transition
+  if (S.transition > 0) {
+    S.transition += 0.04;
+    if (S.transition >= 1.5) finishSceneChange();
+  }
+  if (S.transition < 0) {
+    S.transition += 0.04;
+    if (S.transition >= 0) S.transition = 0;
+  }
+
+  if (S.shake > 0) S.shake *= 0.9;
+  if (S.shake < 0.05) S.shake = 0;
+
+  // Particles
+  for (let i = S.particles.length - 1; i >= 0; i--) {
+    const p = S.particles[i]; p.x += p.vx; p.y += p.vy; p.life--;
+    if (p.life <= 0) S.particles.splice(i, 1);
+  }
+
+  // Movement
+  if (S.mode === 'explore') {
+    let mx = 0, my = 0;
+    if (keys.ArrowLeft || keys.a) mx = -1.8;
+    if (keys.ArrowRight || keys.d) mx = 1.8;
+    if (keys.ArrowUp || keys.w) my = -1.8;
+    if (keys.ArrowDown || keys.s) my = 1.8;
+    if (touchTarget) {
+      const d = dist(S.pos, touchTarget);
+      if (d < 3) touchTarget = null;
+      else { mx = (touchTarget.x - S.pos.x) / d * 1.8; my = (touchTarget.y - S.pos.y) / d * 1.8; }
+    }
+    if (mx || my) {
+      if (mx && my) { mx *= 0.7; my *= 0.7; }
+      S.pos.x = Math.max(8, Math.min(GW - 8, S.pos.x + mx));
+      S.pos.y = Math.max(60, Math.min(GH - 16, S.pos.y + my));
+    }
+  }
+
+  if (S.mode === 'qte') updateQTE();
+  if (S.mode === 'rhythm') updateRhythm();
+}
+
+// ═══════════════════════════════════════════
+//  RENDER
+// ═══════════════════════════════════════════
+function render() {
+  // Always fill bg first to avoid white flash
+  rr(0, 0, GW, GH, C.bg);
+
+  if (S.mode === 'title') { renderTitle(); return; }
+  if (S.mode === 'rules') { renderRules(); return; }
+
+  // Scene
+  if (SCENES[S.scene]) SCENES[S.scene]();
+
+  // Objects
+  const objs = OBJS[S.scene] || [];
+  for (const o of objs) {
+    if (o.visible && !o.visible()) continue;
+    if (o.draw) o.draw(o);
+    const d = dist(S.pos, {x:o.x+o.w/2, y:o.y+o.h/2});
+    if (d < 40) txt(o.label, o.x+o.w/2-o.label.length*6, o.y-8, 10, o.color);
+    if (d < 28) { const a=0.15+Math.sin(S.frame*0.12)*0.1; ctx.strokeStyle=o.color+Math.floor(a*15).toString(16); ctx.strokeRect(o.x-2,o.y-2,o.w+4,o.h+4); }
+  }
+
+  // Player with outline
+  const bob = Math.sin(S.frame * 0.1) * (S.mode==='explore'?1.5:0);
+  const sx = S.pos.x, sy = S.pos.y + bob;
+  // Outline (dark pixels around the sprite for visibility)
+  ctx.fillStyle = '#00000088';
+  if (S.stage === 'nymph') drawSprite(NYMPH, sx-2, sy-5, '#00000088', 1);
+  else drawSprite(ADULT, sx-5, sy-7, '#00000088', 1);
+  // Main sprite
+  if (S.stage === 'nymph') {
+    drawSprite(NYMPH, sx-3, sy-4, C.green, 1);
+    if (S.mode==='explore') px(sx-1+Math.sin(S.frame*0.2)*2, sy+4, 2, 3, C.green+'88');
+  } else {
+    drawSprite(ADULT, sx-4, sy-6, C.amber, 1);
+    if (S.frame%6<3) { px(sx-2,sy-5,1,4,C.white+'22');px(sx+1,sy-5,1,4,C.white+'22'); }
+  }
+
+  // Particles
+  for (const p of S.particles) px(p.x, p.y, 2, 2, p.color + Math.floor(p.life/30*15).toString(16));
+
+  // ── Stats Bar ──
+  const barY = 4, barH = 18;
+  rr(2, barY, GW-4, barH, C.dark+'cc');
+  ctx.strokeStyle = C.white+'18'; ctx.strokeRect(2, barY, GW-4, barH);
+
+  // Satiety (compact)
+  const satPct = S.satiety / 100;
+  txt('饱食', 8, barY+13, 9, C.green);
+  rr(38, barY+4, 52, 8, '#00000044');
+  rr(38, barY+4, (52*satPct)|0, 8, C.green+'aa');
+
+  // Flight (compact)
+  const flPct = S.flight / 100;
+  txt('飞行', 96, barY+13, 9, C.amber);
+  rr(126, barY+4, 52, 8, '#00000044');
+  rr(126, barY+4, (52*flPct)|0, 8, C.amber+'aa');
+
+  // Day/time
+  const tl = {morning:'清晨',noon:'正午',dusk:'黄昏',night:'夜晚',daytime:'白天'};
+  txt(`第${S.day}天 ${tl[S.time]||''}`, 188, barY+13, 9, C.white);
+  // Divider
+  rr(182, barY+2, 1, barH-4, C.white+'18');
+
+  // ── Dialogue ──
+  if (S.mode === 'dialogue' || S.mode === 'choice') {
+    if (S.dchar < S.dtext.length && S.mode === 'dialogue') {
+      S.dtimer++; if (S.dtimer > 1.5) { S.dchar++; S.dtimer = 0; }
+    }
+    const dt = S.dtext.substring(0, S.dchar);
+    rr(6, GH-62, GW-12, 56, C.dark+'ee');
+    ctx.strokeStyle = C.amber+'66'; ctx.strokeRect(6, GH-62, GW-12, 56);
+    txt(dt, 12, GH-40, 12, C.white);
+    if (S.mode==='dialogue' && S.dchar>=S.dtext.length)
+      txt('▼ 空格继续', GW-80, GH-10, 10, C.amber);
+  }
+
+  // ── Choices ──
+  if (S.mode === 'choice' && S.choices.length > 0) {
+    const ch = S.choices;
+    const baseY = GH - 64 - ch.length * 24;
+    for (let i = 0; i < ch.length; i++) {
+      const cy = baseY + i * 24;
+      const sel = S._choiceIdx === i;
+      rr(22, cy, GW-44, 22, sel ? C.amber+'33' : C.dark+'cc');
+      ctx.strokeStyle = sel ? C.amber : C.white+'28'; ctx.strokeRect(22, cy, GW-44, 22);
+      txt((sel?'► ':'  ')+ch[i].text, 28, cy+15, 10, sel ? C.amber : C.white);
+    }
+  }
+
+  // ── QTE ──
+  if (S.mode === 'qte') {
+    rr(0,0,GW,GH,C.bg+'cc');
+    ctx.textAlign='center';
+    txt('挣脱旧壳！', GW/2, 70, 18, C.amber);
+    txt('交替按 ← → 方向键', GW/2, 94, 12, C.white);
+    ctx.textAlign='left';
+    rr(40,112,240,18,C.dark);
+    const pw = Math.max(0,Math.min(1,S.qteProgress/100))*240;
+    rr(40,112,pw,18,S.qteProgress>60?C.amber:(S.qteProgress>30?C.amber+'aa':C.red));
+    ctx.strokeStyle=C.white; ctx.strokeRect(40,112,240,18);
+    ctx.textAlign='center'; txt(Math.floor(S.qteProgress)+'%', GW/2, 144, 11, C.white); ctx.textAlign='left';
+  }
+
+  // ── Rhythm ──
+  if (S.mode === 'rhythm') {
+    rr(0,0,GW,GH,C.bg+'aa');
+    ctx.textAlign='center';
+    txt('求偶之舞！', GW/2, 28, 18, C.amber);
+    txt('匹配方向键  (手机点底部按钮)', GW/2, 48, 11, C.white);
+    ctx.textAlign='left';
+    const lx=[60,110,160,210], dirs=['left','up','down','right'], lbs=['←','↑','↓','→'];
+    for(let i=0;i<4;i++){
+      ctx.strokeStyle=C.white+'22'; ctx.strokeRect(lx[i],50,40,GH-100);
+      txt(lbs[i],lx[i]+10,S.rHitZone,18,C.white+'44');
+      rr(lx[i],195,40,35,C.dark+'66');
+      ctx.strokeStyle=C.white+'33'; ctx.strokeRect(lx[i],195,40,35);
+      txt(lbs[i],lx[i]+10,220,16,C.white);
+    }
+    for(const n of S.rNotes){
+      if(n.hit)continue;
+      const idx=dirs.indexOf(n.dir), nx=lx[idx]+10;
+      txt(lbs[idx],nx,n.y,16,n.y>S.rHitZone-10&&n.y<S.rHitZone+10?C.amber:C.white);
+    }
+    ctx.strokeStyle=C.amber+'44'; ctx.beginPath(); ctx.moveTo(50,S.rHitZone); ctx.lineTo(250,S.rHitZone); ctx.stroke();
+    ctx.textAlign='center'; txt('命中: '+S.rScore+'/'+S.rTotal, GW/2, GH-14, 11, C.amber); ctx.textAlign='left';
+  }
+
+  // ── Ending ──
+  if (S.mode === 'ending' && S._endingData) {
+    rr(0,0,GW,GH,C.bg+'ee');
+    const ed=S._endingData;
+    ctx.textAlign='center';
+    txt(ed.title, GW/2, 44, 22, ed.color);
+    txt(ed.sub, GW/2, 72, 12, C.white+'88');
+    for(let i=0;i<ed.lines.length;i++)
+      txt(ed.lines[i], GW/2, 100+i*20, 12, C.white);
+    txt('已收集结局: '+savedEndings.join(' '), GW/2, GH-44, 10, C.white+'66');
+    txt('已收集 '+savedEndings.length+'/5 种结局', GW/2, GH-28, 10, C.amber+'aa');
+    const t2=S.frame%60<40?'按空格键或点击屏幕 重新开始':'';
+    txt(t2, GW/2, GH-8, 10, C.white+'88');
+    ctx.textAlign='left';
+  }
+
+  // ── Transition overlay ──
+  if (S.transition > 0) {
+    const a = Math.min(1, S.transition);
+    rr(0, 0, GW, GH, C.bg+Math.floor(a*15).toString(16));
+    ctx.textAlign='center'; txt('加载中...', GW/2, GH/2, 16, C.amber); ctx.textAlign='left';
+  }
+  if (S.transition < 0) {
+    const a = Math.min(1, 1 + S.transition);
+    rr(0, 0, GW, GH, C.bg+Math.floor(a*15).toString(16));
+  }
+
+  // Wing dry timer
+  if (S.wingDryTimer>0&&S.mode==='explore'&&S.scene==='water_surface')
+    txt('翅膀干燥中... '+Math.ceil(S.wingDryTimer/60)+'秒', 85, 32, 11, C.amber);
+}
+
+function renderTitle() {
+  rr(0, 0, GW, GH, C.bg);
+  ctx.textAlign = 'center';
+  drawSprite(ADULT, 140, 38, C.amber, 2);
+  drawSprite(ADULT, 150, 48, C.green+'66', 2);
+  drawSprite(ADULT, 170, 32, C.amber+'44', 2);
+  txt('蜉 蝣 的  7 2  小 时', GW/2, 115, 20, C.amber);
+  txt('像素人生模拟器 #001', GW/2, 143, 11, C.white+'88');
+  rr(GW/2-100, 154, 200, 1, C.amber+'44');
+  rr(GW/2-100, 156, 200, 1, C.white+'18');
+  const blink = S.frame % 90 < 60;
+  if (blink) txt('— 按 空 格 键 或 点 击 屏 幕 —', GW/2, 190, 11, C.white+'aa');
+  txt('已收集结局: '+savedEndings.length+'/5', GW/2, 218, 9, C.amber+'66');
+  ctx.textAlign = 'left';
+}
+
+function renderRules() {
+  rr(0, 0, GW, GH, C.bg);
+  ctx.textAlign = 'center';
+  txt('游 戏 规 则', GW/2, 40, 18, C.amber);
+  rr(GW/2-110, 52, 220, 1, C.amber+'44');
+  ctx.textAlign = 'left';
+  const rules = [
+    '→  你是蜉蝣，只有72小时的生命。',
+    '→  用方向键移动，空格键与物体互动。',
+    '→  不同的选择会改变你的属性值。',
+    '→  属性值影响关键事件的成败。',
+    '→  共有 5 种结局等你发现。',
+    '→  可以反复游玩，收集全部结局。',
+    '→  结局会自动保存在浏览器中。',
+  ];
+  for (let i = 0; i < rules.length; i++)
+    txt(rules[i], 36, 80 + i * 22, 11, C.white);
+  ctx.textAlign = 'center';
+  rr(GW/2-110, 80+rules.length*22+4, 220, 1, C.amber+'44');
+  const blink = S.frame % 90 < 60;
+  if (blink) txt('— 按 空 格 键 开 始 游 戏 —', GW/2, 80+rules.length*22+26, 11, C.white+'aa');
+  ctx.textAlign = 'left';
+}
+
+// ═══════════════════════════════════════════
+//  RESTART & INTRO
+// ═══════════════════════════════════════════
+function restartGame() {
+  if (S._wingDryCheck) { clearInterval(S._wingDryCheck); S._wingDryCheck = null; }
+  Object.assign(S, {
+    scene:'river_bottom',day:1,time:'morning',satiety:70,flight:40,stage:'nymph',
+    pos:{x:160,y:180},target:null,flags:{},mode:'dialogue',ending:null,
+    transition:0,particles:[],shake:0,
+    dq:[],dtext:'',dchar:0,dtimer:0,choices:[],
+    qteProgress:0,qteDeplete:3,qteGain:8,qteLastDir:-1,
+    rNotes:[],rScore:0,rActive:false,
+    wingDryTimer:0,foodChosen:false,scene3Interactions:0,
+    _noonTriggered:false,_wingChoiceOffered:false,_choiceIdx:0,
+    _onDialogEnd:null,_endingData:null,
+  });
+  startIntro();
+}
+
+function startIntro() {
+  queueDialog([
+    '你是一只蜉蝣若虫。',
+    '你在河底的石头下生活了整整一年。',
+    '但今天……有些不一样。',
+    '一种无法解释的冲动在你体内涌动。',
+    '是时候浮出水面了。',
+  ]);
+  S._onDialogEnd = () => {
+    showChoices('你要做什么？', [
+      {text:'出来探索', cb:()=>{ queueDialog(['你从石头下爬了出来。水草在微光中摇曳。','阳光穿过水面，在河底投下斑驳的光影。']); S._noonTriggered=false; }},
+      {text:'再躲一会儿', cb:()=>{ queueDialog(['你又缩了回去。黑暗让你感到安全。','但你也知道——躲不了太久了。']); S.flags.hid=true; S.satiety=Math.max(10,S.satiety-5); S._noonTriggered=false; setTimeout(()=>{ if(S.mode==='explore'){S.time='noon';queueDialog(['正午了。水流带来了一片落叶。']);} },2000); }},
+    ], ()=>{});
+  };
+}
+
+// ═══════════════════════════════════════════
+//  MAIN LOOP
+// ═══════════════════════════════════════════
+function resizeCanvas() {
+  const maxW = window.innerWidth;
+  const maxH = window.innerHeight;
+  const ratio = GW / GH;
+  let w, h;
+  if (maxW / maxH > ratio) { h = maxH; w = h * ratio; }
+  else { w = maxW; h = w / ratio; }
+  canvas.style.width = w + 'px';
+  canvas.style.height = h + 'px';
+}
+
+function gameLoop() {
+  update();
+  render();
+  requestAnimationFrame(gameLoop);
+}
+
+// ═══════════════════════════════════════════
+//  INIT
+// ═══════════════════════════════════════════
+canvas.width = GW * CD;
+canvas.height = GH * CD;
+ctx.scale(CD, CD);
+resizeCanvas();
+window.addEventListener('resize', resizeCanvas);
+gameLoop();
+</script>
+</body>
+</html>
